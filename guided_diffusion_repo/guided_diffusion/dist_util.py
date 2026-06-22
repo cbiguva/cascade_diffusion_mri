@@ -1,5 +1,14 @@
 """
 Helpers for distributed training.
+
+Supports two modes:
+  1. torchrun / torch.distributed.launch (PREFERRED, no MPI needed):
+       CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_script.py ...
+  2. Single-GPU fallback:
+       python train_script.py ...
+
+The original guided-diffusion used MPI via mpi4py.  This version removes that
+dependency and uses PyTorch-native distributed primitives only.
 """
 
 import io
@@ -7,13 +16,9 @@ import os
 import socket
 
 import blobfile as bf
-from mpi4py import MPI
 import torch as th
 import torch.distributed as dist
 
-# Change this to reflect your cluster layout.
-# The GPU for a given rank is (rank % GPUS_PER_NODE).
-GPUS_PER_NODE = 8
 
 SETUP_RETRY_COUNT = 3
 
@@ -21,25 +26,28 @@ SETUP_RETRY_COUNT = 3
 def setup_dist():
     """
     Setup a distributed process group.
+
+    Works with torchrun (which sets RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR,
+    MASTER_PORT env vars automatically).  If those are not set, falls back to
+    single-process mode.
     """
     if dist.is_initialized():
         return
-    os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
 
-    comm = MPI.COMM_WORLD
-    backend = "gloo" if not th.cuda.is_available() else "nccl"
-
-    if backend == "gloo":
-        hostname = "localhost"
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        # ── Launched via torchrun ─────────────────────────────────────────
+        backend = "nccl" if th.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        th.cuda.set_device(local_rank)
     else:
-        hostname = socket.gethostbyname(socket.getfqdn())
-    os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
-    os.environ["RANK"] = str(comm.rank)
-    os.environ["WORLD_SIZE"] = str(comm.size)
-
-    port = comm.bcast(_find_free_port(), root=0)
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend=backend, init_method="env://")
+        # ── Single-process fallback ───────────────────────────────────────
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", str(_find_free_port()))
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        backend = "nccl" if th.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
 
 
 def dev():
@@ -47,29 +55,42 @@ def dev():
     Get the device to use for torch.distributed.
     """
     if th.cuda.is_available():
-        return th.device(f"cuda")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        return th.device(f"cuda:{local_rank}")
     return th.device("cpu")
 
 
 def load_state_dict(path, **kwargs):
     """
-    Load a PyTorch file without redundant fetches across MPI ranks.
+    Load a PyTorch file.  Rank 0 reads from disk and broadcasts to others.
     """
-    chunk_size = 2 ** 30  # MPI has a relatively small size limit
-    if MPI.COMM_WORLD.Get_rank() == 0:
+    if dist.get_world_size() == 1:
+        # Single process — just load directly
         with bf.BlobFile(path, "rb") as f:
             data = f.read()
-        num_chunks = len(data) // chunk_size
-        if len(data) % chunk_size:
-            num_chunks += 1
-        MPI.COMM_WORLD.bcast(num_chunks)
-        for i in range(0, len(data), chunk_size):
-            MPI.COMM_WORLD.bcast(data[i : i + chunk_size])
+        return th.load(io.BytesIO(data), **kwargs)
+
+    # Multi-process: rank 0 reads, broadcasts length then data
+    if dist.get_rank() == 0:
+        with bf.BlobFile(path, "rb") as f:
+            data = f.read()
+        length = th.tensor([len(data)], dtype=th.long, device="cpu")
     else:
-        num_chunks = MPI.COMM_WORLD.bcast(None)
-        data = bytes()
-        for _ in range(num_chunks):
-            data += MPI.COMM_WORLD.bcast(None)
+        data = None
+        length = th.tensor([0], dtype=th.long, device="cpu")
+
+    dist.broadcast(length, src=0)
+
+    if dist.get_rank() != 0:
+        data = bytes(length.item())
+        data_tensor = th.zeros(length.item(), dtype=th.uint8)
+    else:
+        data_tensor = th.frombuffer(bytearray(data), dtype=th.uint8).clone()
+
+    dist.broadcast(data_tensor, src=0)
+
+    if dist.get_rank() != 0:
+        data = bytes(data_tensor.numpy())
 
     return th.load(io.BytesIO(data), **kwargs)
 

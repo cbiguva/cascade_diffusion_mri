@@ -51,10 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mri_dataloader import load_mri_sr_data
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UNET_SMALL config for 384×384 SR model
-# SuperResModel receives concat([noisy_384, condition_384]) → 2*in_channels input
-# ─────────────────────────────────────────────────────────────────────────────
+
 SR_UNET_SMALL = dict(
     large_size            = 384,      # output (and noisy input) resolution
     small_size            = 96,       # low-res input resolution (used by dataloader)

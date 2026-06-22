@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────────
+# run_train_edm_mri_sr.sh — Train EDM SR model for 2ch MRI (96→384)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Usage:
+#   GPUS=4,5 bash scripts/run_train_edm_mri_sr.sh
+#
+# CDM conditioning augmentation (§4.2):
+#   Always applied.  s ~ Uniform{0,…,S},  S = 300 (30% of T=1000).
+# ──────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# ── Conda environment ─────────────────────────────────────────────────────────
+CONDA_ENV="${CONDA_ENV:-${HOME}/miniconda/envs/fastmri}"
+TORCHRUN="${CONDA_ENV}/bin/torchrun"
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+DATA_DIR="${DATA_DIR:-/data/Sahil_dataset/MRI_processed/train/AXT2_normalized}"
+OUTDIR="${OUTDIR:-${PROJECT_ROOT}/checkpoints/edm_mri_sr_384}"
+BATCH="${BATCH:-32}"
+BATCH_GPU="${BATCH_GPU:-16}"
+LR="${LR:-1e-4}"
+TOTAL_KIMG="${TOTAL_KIMG:-200000}"
+COND_AUG_S="${COND_AUG_S:-300}"
+MODEL_CHANNELS="${MODEL_CHANNELS:-64}"
+DROPOUT="${DROPOUT:-0.00}"
+TICK="${TICK:-5}"
+SNAP="${SNAP:-15}"
+SEED="${SEED:-0}"
+FP16="${FP16:-false}"
+GPUS="${GPUS:-2,3}"
+RESUME_PKL="${RESUME_PKL:-}"
+RESUME_STATE="${RESUME_STATE:-}"
+RESUME_KIMG="${RESUME_KIMG:-0}"
+
+# ── Parse GPUs ────────────────────────────────────────────────────────────────
+IFS=',' read -ra GPU_ARRAY <<< "$GPUS"
+NUM_GPUS=${#GPU_ARRAY[@]}
+
+echo "============================================================"
+echo "  EDM MRI SR Model Training (2ch, 96→384)"
+echo "  CDM Conditioning Augmentation: S=${COND_AUG_S} (always)"
+echo "============================================================"
+echo "  GPUs:          $GPUS ($NUM_GPUS GPU(s))"
+echo "  Data:          $DATA_DIR"
+echo "  Output:        $OUTDIR"
+echo "  Batch size:    $BATCH (batch_gpu=$BATCH_GPU)"
+echo "  Learning rate: $LR"
+echo "  Total kimg:    $TOTAL_KIMG"
+echo "  Cond aug S:    $COND_AUG_S / 1000"
+echo "  model_channels:$MODEL_CHANNELS"
+echo "  Dropout:       $DROPOUT"
+echo "  FP16:          $FP16"
+echo "  Seed:          $SEED"
+echo "============================================================"
+
+mkdir -p "$OUTDIR"
+
+ARGS=(
+    --data_dir      "$DATA_DIR"
+    --outdir        "$OUTDIR"
+    --batch         "$BATCH"
+    --batch_gpu     "$BATCH_GPU"
+    --lr            "$LR"
+    --total_kimg    "$TOTAL_KIMG"
+    --cond_aug_max_timestep "$COND_AUG_S"
+    --model_channels "$MODEL_CHANNELS"
+    --dropout       "$DROPOUT"
+    --tick          "$TICK"
+    --snap          "$SNAP"
+    --seed          "$SEED"
+)
+
+if [ "$FP16" = "true" ]; then
+    ARGS+=(--fp16)
+fi
+
+if [ -n "$RESUME_PKL" ]; then
+    ARGS+=(--resume_pkl "$RESUME_PKL" --resume_kimg "$RESUME_KIMG")
+    echo "  Resuming from: $RESUME_PKL at kimg=$RESUME_KIMG"
+fi
+if [ -n "$RESUME_STATE" ]; then
+    ARGS+=(--resume_state "$RESUME_STATE")
+fi
+
+# ── Launch ────────────────────────────────────────────────────────────────────
+export CUDA_VISIBLE_DEVICES="$GPUS"
+MASTER_PORT="${MASTER_PORT:-29503}"
+
+"$TORCHRUN" \
+    --standalone \
+    --master_port="$MASTER_PORT" \
+    --nproc_per_node="$NUM_GPUS" \
+    "${SCRIPT_DIR}/train_edm_mri_sr_384.py" \
+    "${ARGS[@]}"

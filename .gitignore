@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────────────────────────
+# Cascaded Diffusion MRI — .gitignore
+# ─────────────────────────────────────────────────────────────────
+
+# ── Checkpoints & model weights (too large for GitHub) ───────────
+checkpoints/
+*.pkl
+*.pt
+*.pth
+*.ckpt
+
+# ── Data (large datasets) ───────────────────────────────────────
+data/
+
+# ── Generated samples ───────────────────────────────────────────
+samples/
+
+# ── Python caches ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ── Jupyter notebook checkpoints ────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Environment / IDE ───────────────────────────────────────────
+.env
+.venv/
+env/
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+.vscode/
+.idea/
+
+# ── OS files ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*~
+
+# ── Logs & temp ─────────────────────────────────────────────────
+*.log
+*.swp
+*.swo
+
+# ── EDM repo (included as submodule or vendored) ────────────────
+# We include edm_repo code but exclude its .git
+edm_repo/.git/
+
+# ── Dataset index caches ────────────────────────────────────────
+index_cache*.pkl
+
+# ── Misc ────────────────────────────────────────────────────────
+inst.md
+walk.md

@@ -37,9 +37,11 @@ import random
 from collections import OrderedDict
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import math
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,8 +162,37 @@ def _nn_upsample(img: torch.Tensor, size: int = 384) -> torch.Tensor:
     return hw_rep
 
 
+def _gaussian_blur_2d(img: torch.Tensor, sigma: float, kernel_size: int = 7) -> torch.Tensor:
+    """
+    Apply a 2-D Gaussian blur to a (1, H, W) tensor.
+
+    sigma      : standard deviation of the Gaussian kernel (pixels).
+                 If 0, returns the image unchanged.
+    kernel_size: must be odd; 7 is a safe default for sigma up to ~2.
+    """
+    if sigma == 0.0:
+        return img
+
+    # Build 1-D Gaussian kernel
+    k = kernel_size
+    coords = torch.arange(k, dtype=torch.float32) - k // 2        # e.g. [-3..3]
+    gauss1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+    gauss1d = gauss1d / gauss1d.sum()
+
+    # Outer product → 2-D kernel, shape (1, 1, k, k)
+    kernel = gauss1d.unsqueeze(0) * gauss1d.unsqueeze(1)          # (k, k)
+    kernel = kernel.unsqueeze(0).unsqueeze(0)                      # (1, 1, k, k)
+
+    # Apply depthwise conv (padding = reflect to avoid border artefacts)
+    img4d = img.unsqueeze(0)                                       # (1, 1, H, W)
+    pad   = k // 2
+    img_padded = F.pad(img4d, (pad, pad, pad, pad), mode='reflect')
+    blurred    = F.conv2d(img_padded, kernel)                      # (1, 1, H, W)
+    return blurred.squeeze(0)                                      # (1, H, W)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Base model dataset  (full 384×384 → average-pool → 96×96)
+# 1. Base model dataset  (full 384×384 to average-pool to 96×96)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MRIBaseDataset(Dataset):
@@ -197,24 +228,72 @@ class MRIBaseDataset(Dataset):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. SR model dataset  (384×384 target + NN-upsampled 96×96 condition)
+#    with truncated conditioning augmentation (CDM paper §4.2)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _linear_beta_schedule(num_timesteps: int = 1000):
+    """
+    Compute √ᾱ_t and √(1−ᾱ_t) for the linear β schedule.
+
+    Matches guided_diffusion.gaussian_diffusion.get_named_beta_schedule("linear", T).
+    Returns two float32 tensors of shape (num_timesteps,).
+    """
+    scale = 1000 / num_timesteps
+    beta_start = scale * 0.0001
+    beta_end   = scale * 0.02
+    betas = np.linspace(beta_start, beta_end, num_timesteps, dtype=np.float64)
+    alphas = 1.0 - betas
+    alphas_cumprod = np.cumprod(alphas, axis=0)
+    sqrt_alphas_cumprod           = torch.from_numpy(np.sqrt(alphas_cumprod)).float()
+    sqrt_one_minus_alphas_cumprod = torch.from_numpy(np.sqrt(1.0 - alphas_cumprod)).float()
+    return sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod
+
 
 class MRISRDataset(Dataset):
     """
     Loads .pt MRI slices, computes magnitude at 384×384.
-    Also produces the blurry condition: average-pool → 96×96, then NN-upsample → 384×384.
+    Produces the blurry condition: pool4x4 → NN-upsample → 384×384.
+
+    Truncated conditioning augmentation (CDM paper §4.2)
+    ----------------------------------------------------
+    With probability ``cond_aug_prob``, a discrete timestep
+    ``s ~ Uniform{0, …, cond_aug_max_timestep}`` is sampled.  s=0 means
+    identity (no corruption).  For s>0, the forward diffusion kernel is
+    applied to the low-res condition:
+
+        z_s = √ᾱ_s · z_0  +  √(1 − ᾱ_s) · ε,   ε ~ N(0, I)
+
+    This attenuates the clean signal and adds appropriately scaled noise,
+    making the SR model robust to imperfect base-model outputs at inference.
+    No augmentation is applied at inference time.
 
     Returns:
         (x, {'low_res': low_res})
         where:
             x       : (1, 384, 384)  float32 in [-1, 1]  – HR target
-            low_res : (1, 384, 384)  float32 in [-1, 1]  – blurry NN condition
+            low_res : (1, 384, 384)  float32              – augmented condition
     """
 
-    def __init__(self, pt_dir: str, augment: bool = True, cache_size: int = 4):
-        self.index   = _build_index(pt_dir)
-        self.augment = augment
-        self._cache  = _LRUFileCache(max_size=cache_size)
+    def __init__(
+        self,
+        pt_dir: str,
+        augment: bool = True,
+        cache_size: int = 4,
+        cond_aug_prob: float = 1.0,            # CDM paper: augment every sample
+        cond_aug_max_timestep: int = 200,      # S — max diffusion timestep for augmentation
+        num_diffusion_timesteps: int = 1000,   # T — total diffusion timesteps (must match SR model)
+    ):
+        self.index                = _build_index(pt_dir)
+        self.augment              = augment
+        self._cache               = _LRUFileCache(max_size=cache_size)
+        self.cond_aug_prob        = cond_aug_prob
+        self.cond_aug_max_timestep = cond_aug_max_timestep
+
+        # Precompute schedule coefficients for conditioning augmentation
+        sqrt_ac, sqrt_1m_ac = _linear_beta_schedule(num_diffusion_timesteps)
+        self.sqrt_alphas_cumprod           = sqrt_ac       # (T,)
+        self.sqrt_one_minus_alphas_cumprod  = sqrt_1m_ac    # (T,)
 
     def __len__(self):
         return len(self.index)
@@ -228,11 +307,23 @@ class MRISRDataset(Dataset):
         x    = mag.unsqueeze(0)           # (1, 384, 384)
 
         if self.augment and random.random() < 0.5:
-            x = x.flip(-1)
+            x = x.flip(-1)               # random horizontal flip
 
-        # Build blurry condition: pool → upsample
+        # ── Build blurry condition: pool → upsample ───────────────────────────
         x96     = _pool4x4(x)            # (1,  96,  96)
-        low_res = _nn_upsample(x96)      # (1, 384, 384)  pixelated blocks
+        low_res = _nn_upsample(x96)      # (1, 384, 384)  pixelated 4× blocks
+
+        # ── Truncated conditioning augmentation (CDM paper §4.2) ──────────────
+        # Sample a discrete timestep s from {0, …, S}.  s=0 means identity
+        # (no corruption).  For s>0 apply the forward diffusion kernel:
+        #   z_s = √ᾱ_s · z_0  +  √(1 − ᾱ_s) · ε
+        if self.augment and random.random() < self.cond_aug_prob:
+            s = random.randint(0, self.cond_aug_max_timestep)  # 0 = identity
+            if s > 0:
+                sqrt_alpha    = self.sqrt_alphas_cumprod[s - 1]    # 0-indexed
+                sqrt_1m_alpha = self.sqrt_one_minus_alphas_cumprod[s - 1]
+                noise   = torch.randn_like(low_res)
+                low_res = sqrt_alpha * low_res + sqrt_1m_alpha * noise
 
         return x, {'low_res': low_res}
 
@@ -266,13 +357,33 @@ def load_mri_data(pt_dir: str, batch_size: int, num_workers: int = 4, augment: b
     return _infinite_loader(ds, batch_size, num_workers)
 
 
-def load_mri_sr_data(pt_dir: str, batch_size: int, num_workers: int = 4, augment: bool = True):
+def load_mri_sr_data(
+    pt_dir: str,
+    batch_size: int,
+    num_workers: int = 4,
+    augment: bool = True,
+    cond_aug_prob: float = 1.0,
+    cond_aug_max_timestep: int = 200,
+    num_diffusion_timesteps: int = 1000,
+):
     """
     Infinite generator for the SR 96→384 model.
 
     Yields:  (x, {'low_res': low_res})
       x       : (B, 1, 384, 384)  float32  in [-1, 1]  – HR target
-      low_res : (B, 1, 384, 384)  float32  in [-1, 1]  – blurry NN condition
+      low_res : (B, 1, 384, 384)  float32               – augmented condition
+                (pool4x4 → NN-upsample, then truncated diffusion aug)
+
+    Truncated conditioning augmentation (CDM paper §4.2):
+      cond_aug_prob           – fraction of examples that get augmented (default 0.5)
+      cond_aug_max_timestep   – S: max diffusion timestep for augmentation (default 200)
+      num_diffusion_timesteps – T: total diffusion steps, must match SR model (default 1000)
     """
-    ds = MRISRDataset(pt_dir, augment=augment)
+    ds = MRISRDataset(
+        pt_dir,
+        augment=augment,
+        cond_aug_prob=cond_aug_prob,
+        cond_aug_max_timestep=cond_aug_max_timestep,
+        num_diffusion_timesteps=num_diffusion_timesteps,
+    )
     return _infinite_loader(ds, batch_size, num_workers)

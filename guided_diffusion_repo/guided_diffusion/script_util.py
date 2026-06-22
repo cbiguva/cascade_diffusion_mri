@@ -160,6 +160,8 @@ def create_model(
             channel_mult = (1, 2, 2, 2)   # ← added for 96×96 MRI base model
         elif image_size == 64:
             channel_mult = (1, 2, 3, 4)
+        elif image_size == 32:
+            channel_mult = (1, 2, 2)       # ← added for 32×32 AFHQ base model
         else:
             raise ValueError(f"unsupported image size: {image_size}")
     else:
