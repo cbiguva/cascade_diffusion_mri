@@ -1,0 +1,18 @@
+============================================================
+  EDM MRI Base Model Training (96×96) — A40 × 3
+  Node    : udc-ba02-35
+  GPUs    : 3 × A40 (CUDA_VISIBLE_DEVICES=0,1,2)
+  Data    : /data/Sahil_dataset/MRI_processed/train/AXT2_normalized
+  Output  : /standard/CBIG-Standard-ECE/Sahil/mri_cascaded_diffusion/checkpoints/edm_mri_base_96
+  Batch   : 16 per GPU  →  global 48
+  LR      : 1e-3
+  kimg    : 200000
+  FP16    : false
+  Time    : Tue Jun 23 00:16:18 EDT 2026
+============================================================
+SLURM_JOB_GPUS: 1,2,3
+0, NVIDIA A40, 46068 MiB, 45375 MiB
+1, NVIDIA A40, 46068 MiB, 45375 MiB
+2, NVIDIA A40, 46068 MiB, 45375 MiB
+  Resuming from: checkpoints/edm_mri_base_96/network-snapshot-027597.pkl at kimg=0
+  torchrun : /home/vpn9ej/miniconda3/envs/edm/bin/torchrun

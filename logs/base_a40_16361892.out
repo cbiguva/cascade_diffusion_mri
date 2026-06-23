@@ -1,0 +1,15 @@
+============================================================
+  MRI Cascaded Diffusion — BASE MODEL (96×96)
+  Node    : udc-ba02-35
+  GPUs    : 3 × A40 (CUDA_VISIBLE_DEVICES=0,1,2)
+  Data    : /data/Sahil_dataset/MRI_processed/train/AXT2_normalized
+  Output  : /standard/CBIG-Standard-ECE/Sahil/mri_cascaded_diffusion/checkpoints/base_96_a40
+  Batch   : 16 per GPU  →  global 48
+  LR      : 1e-4
+  Time    : Tue Jun 23 00:12:55 EDT 2026
+============================================================
+SLURM_JOB_GPUS: 1,2,3
+0, NVIDIA A40, 46068 MiB, 45375 MiB
+1, NVIDIA A40, 46068 MiB, 45375 MiB
+2, NVIDIA A40, 46068 MiB, 45375 MiB
+  Python  : /home/vpn9ej/.conda/envs/fastmri/bin/python
