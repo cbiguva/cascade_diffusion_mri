@@ -135,6 +135,79 @@ def make_cartesian_mask(size: int, acceleration: int,
     return mask.view(1, 1, size, 1).expand(1, 1, size, size).clone()
 
 
+def make_radial_mask(size: int, acceleration: int,
+                     num_spokes: int | None = None,
+                     seed: int = 42) -> torch.Tensor:
+    """
+    Build a 2D radial (projection) undersampling mask.
+
+    The mask is a set of straight spokes passing through the centre of a
+    DC-centred k-space, at golden-angle increments (~111.25°) starting from a
+    seeded random angle.  Because every spoke passes through the centre this
+    matches the ``fftshift``-ed convention used by :class:`MRIOperator`, and the
+    central crop of a radial mask is still radial — consistent with the
+    cascade's :func:`crop_kspace_center` step (Stage-1 mask = centre crop of the
+    Stage-2 mask).
+
+    Acceleration is defined in the **pixel** (sampling-density) sense — spokes
+    are added until the acquired fraction reaches ``1 / acceleration`` — so it is
+    directly comparable to :func:`make_cartesian_mask`'s acceleration (which
+    acquires ≈ size/acceleration full lines).  Pass ``num_spokes`` to specify the
+    spoke count explicitly instead (overrides ``acceleration``).
+
+    Parameters
+    ----------
+    size : int
+        k-space side length.
+    acceleration : int
+        Target pixel-domain undersampling factor (ignored if ``num_spokes`` set).
+    num_spokes : int, optional
+        Explicit number of spokes.
+    seed : int
+        Seeds the random starting angle so different seeds give different
+        (but equivalent) spoke sets.
+
+    Returns
+    -------
+    (1, 1, size, size) float32 mask, 1 = acquired.
+    """
+    mask   = torch.zeros(size, size, dtype=torch.float32)
+    cx = cy = size // 2
+    radius = size / 2.0
+    # Step the spoke in 0.5-px increments so the rasterised line has no gaps.
+    t = torch.arange(-radius, radius, 0.5)
+
+    rng    = np.random.RandomState(seed)
+    theta  = float(rng.uniform(0, np.pi))             # random starting angle
+    golden = float(np.pi * (np.sqrt(5) - 1) / 2)      # radial golden angle ~111.25°
+
+    def _add_spoke(th: float) -> None:
+        xs = (cx + t * float(np.cos(th))).round().long()
+        ys = (cy + t * float(np.sin(th))).round().long()
+        v  = (xs >= 0) & (xs < size) & (ys >= 0) & (ys < size)
+        mask[ys[v], xs[v]] = 1.0
+
+    target     = (size * size) / float(acceleration)  # desired #acquired samples
+    max_spokes = 4 * size                              # safety cap
+    n = 0
+    while True:
+        _add_spoke(theta)
+        theta += golden
+        n += 1
+        if num_spokes is not None:
+            if n >= num_spokes:
+                break
+        elif mask.sum().item() >= target or n >= max_spokes:
+            break
+
+    acq = mask.sum().item()
+    print(f"[make_radial_mask] {size}×{size}, {n} golden-angle spokes, "
+          f"{acq:.0f}/{size * size} samples "
+          f"(pixel accel {size * size / max(acq, 1):.1f}×)")
+
+    return mask.view(1, 1, size, size).clone()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Multi-coil SENSE operator  (both cascade stages)
 # ─────────────────────────────────────────────────────────────────────────────
