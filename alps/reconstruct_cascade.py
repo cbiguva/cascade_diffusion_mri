@@ -59,7 +59,8 @@ from edm_sr_model import EDMSRPrecond          # noqa — needed for pickle
 from training.networks import EDMPrecond        # noqa — needed for pickle
 
 from alps.sampling  import cascaded_ALPS, ALPSOptions
-from alps.operators import MRIOperator, make_cartesian_mask    # for Fourier cropping helper
+from alps.operators import (MRIOperator, make_cartesian_mask,
+                            avg_pool_complex, crop_kspace_center)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -70,15 +71,24 @@ def _to_complex(x: torch.Tensor) -> torch.Tensor:
     return torch.complex(x[:, 0], x[:, 1])
 
 
-def _image_to_kspace(image_2ch: torch.Tensor) -> torch.Tensor:
+def _image_to_kspace_centred(image_2ch: torch.Tensor) -> torch.Tensor:
     """
-    2-channel image → 2-channel k-space via 2D FFT.
+    2-channel image → single-coil complex k-space via **centred** orthonormal FFT.
+
+    Uses the same ifftshift → fft2 → fftshift convention as operators.py so
+    the k-space values match what MRIOperator.get_measurements expects.
 
     image_2ch : (B, 2, H, W)
-    returns   : (B, 2, H, W)
+    returns   : (B, 1, H, W) complex
     """
-    kc = torch.fft.fft2(_to_complex(image_2ch), norm='ortho')
-    return torch.stack([kc.real, kc.imag], dim=1)
+    xc = _to_complex(image_2ch)                               # (B, H, W)
+    k  = torch.fft.fftshift(
+        torch.fft.fft2(
+            torch.fft.ifftshift(xc, dim=(-2, -1)), norm='ortho'
+        ),
+        dim=(-2, -1),
+    )                                                         # (B, H, W) complex
+    return k.unsqueeze(1)                                     # (B, 1, H, W)
 
 
 def magnitude(x: torch.Tensor) -> np.ndarray:
@@ -210,40 +220,47 @@ def main(args):
 
         slice_2ch = slice_2ch.to(device)   # (1, 2, 384, 384)
 
-        # Simulate fully sampled k-space (FFT of magnitude image)
-        full_kspace = _image_to_kspace(slice_2ch)   # (1, 2, 384, 384)
+        # Simulate fully sampled k-space using the centred FFT convention that
+        # matches operators.py (ifftshift → fft2 → fftshift).
+        # Using a single dummy coil (ones CSM) since no real CSM is available.
+        full_kspace_mc = _image_to_kspace_centred(slice_2ch)  # (1, 1, 384, 384)
+        csm_ones       = torch.ones_like(full_kspace_mc)       # (1, 1, 384, 384)
 
         # Run cascaded ALPS
         result = cascaded_ALPS(
-            full_kspace_384 = full_kspace,
-            net_base        = net_base,
-            net_sr          = net_sr,
-            opts_base       = opts_base,
-            opts_sr         = opts_sr,
-            acceleration    = args.accel,
-            acs_fraction    = args.acs_fraction,
-            eta             = args.eta,
-            seed            = args.seed,
-            device          = device,
-            store_stage1    = False,
-            store_stage2    = False,
-            verbose         = True,
+            multicoil_kspace_384 = full_kspace_mc,
+            csm_384              = csm_ones,
+            net_base             = net_base,
+            net_sr               = net_sr,
+            opts_base            = opts_base,
+            opts_sr              = opts_sr,
+            acceleration         = args.accel,
+            acs_fraction         = args.acs_fraction,
+            eta                  = args.eta,
+            seed                 = args.seed,
+            device               = device,
+            store_stage1         = False,
+            store_stage2         = False,
+            verbose              = True,
         )
 
         x96  = result['x96']    # (1, 2,  96,  96)
         x384 = result['x384']   # (1, 2, 384, 384)
 
-        # Zero-filled 96×96 for reference (single-coil: ones coil map).
-        kc      = torch.complex(full_kspace[:, 0], full_kspace[:, 1]).unsqueeze(1)  # (1,1,384,384)
-        csm1    = torch.ones_like(kc)
-        csm1_96 = csm1[..., ::4, ::4]
-        mask_96 = make_cartesian_mask(96, args.accel, args.acs_fraction, args.seed)
-        A1 = MRIOperator(
-            csm=csm1_96, mask=mask_96,
-            eta=args.eta, fft_scale=full_kspace.shape[-1] / 96, device=device,
+        # Zero-filled 96×96 for reference — reuse the same single-coil setup.
+        FULL    = full_kspace_mc.shape[-1]       # 384
+        LOW     = FULL // 4                       # 96
+        # Average-pool the ones CSM to match cascaded_ALPS's Stage-1 setup.
+        csm1_96 = avg_pool_complex(csm_ones, FULL // LOW)    # (1,1,96,96)
+        mask_96 = crop_kspace_center(
+            make_cartesian_mask(FULL, args.accel, args.acs_fraction, args.seed), LOW
         )
-        y1  = A1.get_measurements(kc)
-        zf  = A1.adjoint(y1)   # zero-filled 96×96
+        A1_zf = MRIOperator(
+            csm=csm1_96, mask=mask_96,
+            eta=args.eta, fft_scale=float(FULL) / LOW, device=device,
+        )
+        y1_zf = A1_zf.get_measurements(full_kspace_mc)
+        zf    = A1_zf.adjoint(y1_zf)             # zero-filled 96×96
 
         # ── Save ──────────────────────────────────────────────────────────────
         prefix = os.path.join(args.outdir, f"{case}_s{sidx:03d}")
