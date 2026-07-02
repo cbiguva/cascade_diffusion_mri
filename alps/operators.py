@@ -134,10 +134,12 @@ def make_cartesian_mask(size: int, acceleration: int,
 
     return mask.view(1, 1, size, 1).expand(1, 1, size, size).clone()
 
+from typing import Optional
 
 def make_radial_mask(size: int, acceleration: int,
-                     num_spokes: int | None = None,
+                     num_spokes: Optional[int] = None,
                      seed: int = 42) -> torch.Tensor:
+
     """
     Build a 2D radial (projection) undersampling mask.
 
@@ -244,6 +246,7 @@ class MRIOperator(nn.Module):
                  mask:      torch.Tensor,
                  eta:       float = 0.01,
                  cg_iters:  int   = 10,
+                 
                  cg_tol:    float = 1e-5,
                  fft_scale: float = 1.0,
                  device                  = torch.device('cuda')):
@@ -373,3 +376,5 @@ class MRIOperator(nn.Module):
              + 1j * torch.randn(B, self.n_coils, H, W, device=n.device, dtype=n.dtype)
         z = self.adjoint(eps1) / self.eta + n / t
         return self.PreCondition(z, t)
+
+    

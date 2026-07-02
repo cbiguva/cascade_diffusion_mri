@@ -1,18 +1,26 @@
 """
-train_edm_mri_sr_384.py
------------------------
-Train a 96→384 super-resolution model for 2-channel MRI using EDM.
+train_edm_mri_sr_384_small.py
+------------------------------
+Train a *lightweight* 96->384 super-resolution model for 2-channel MRI using EDM.
+
+Architecture differences vs. train_edm_mri_sr_384.py
+  channel_mult : [1, 2, 3, 3, 4, 4]  ->  [1, 2, 2, 2]   (4 depth levels)
+  num_blocks   : 3                    ->  2               (fewer residual blocks)
+
+Motivation: SR has much lower entropy than unconditional generation; a smaller
+model converges faster, uses less memory, and is faster at inference with
+negligible quality loss.
 
 Architecture : SongUNet (DDPM++ configuration)
-Input        : 4-channel  [c_in·x_noisy | low_res_upsampled]  (2ch noisy + 2ch condition)
+Input        : 4-channel  [c_in*x_noisy | low_res_upsampled]  (2ch noisy + 2ch condition)
 Output       : 2-channel  denoised HR image (Real + Imaginary)
-Augmentation : CDM §4.2 — truncated forward diffusion at 30% (S=300)
+Augmentation : CDM s4.2 -- truncated forward diffusion at 30% (S=300)
 Sampler      : Heun 2nd-order ODE (18 steps at inference)
 
 Usage:
-    torchrun --standalone --nproc_per_node=2 scripts/train_edm_mri_sr_384.py \\
-        --data_dir /data/Sahil_dataset/MRI_processed/train/AXT2_normalized \\
-        --outdir checkpoints/edm_mri_sr_384
+    torchrun --standalone --nproc_per_node=2 scripts/train_edm_mri_sr_384_small.py \
+        --data_dir /data/AXT2_normalized \
+        --outdir checkpoints/edm_mri_sr_384_small
 """
 
 import argparse
@@ -26,7 +34,7 @@ import numpy as np
 import psutil
 import torch
 
-# ── Make EDM importable ──────────────────────────────────────────────────────
+# -- Make EDM importable -------------------------------------------------------
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EDM_PATH = os.path.join(_REPO_ROOT, 'edm_repo')
 if _EDM_PATH not in sys.path:
@@ -36,50 +44,52 @@ from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
 
-# ── Local imports ────────────────────────────────────────────────────────────
+# -- Local imports -------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from edm_sr_model import EDMSRPrecond
 from edm_sr_loss import EDMSRLoss
 from edm_mri_dataloader import MRISRDatasetEDM
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 #  Training loop
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def sr_training_loop(
     outdir,
     data_dir,
-    large_size          = 384,
-    small_size          = 96,
-    img_channels        = 2,
-    num_workers         = 4,
+    large_size            = 384,
+    small_size            = 96,
+    img_channels          = 2,
+    num_workers           = 4,
     cond_aug_max_timestep = 300,
-    model_channels      = 64,
-    channel_mult        = [1, 2, 3, 3, 4, 4],
-    num_blocks          = 3,
-    attn_resolutions    = [16],
-    dropout             = 0.0,
-    batch_size          = 32,
-    batch_gpu           = None,
-    total_kimg          = 200000,
-    lr                  = 1e-4,
-    ema_halflife_kimg   = 500,
-    ema_rampup_ratio    = 0.05,
-    lr_rampup_kimg      = 10000,
-    P_mean              = -1.2,
-    P_std               = 1.2,
-    sigma_data          = 0.5,
-    kimg_per_tick       = 5,
-    snapshot_ticks      = 15,
-    state_dump_ticks    = 50,
-    seed                = 0,
-    resume_pkl          = None,
-    resume_state_dump   = None,
-    resume_kimg         = 0,
-    use_fp16            = False,
-    cudnn_benchmark     = True,
-    device              = torch.device('cuda'),
+    # -- Smaller model config --------------------------------------------------
+    model_channels        = 64,
+    channel_mult          = [1, 2, 2, 2],  # 4 depth levels (was [1,2,3,3,4,4])
+    num_blocks            = 2,             # 2 residual blocks per level (was 3)
+    attn_resolutions      = [16],
+    # --------------------------------------------------------------------------
+    dropout               = 0.0,
+    batch_size            = 32,
+    batch_gpu             = None,
+    total_kimg            = 200000,
+    lr                    = 1e-4,
+    ema_halflife_kimg     = 500,
+    ema_rampup_ratio      = 0.05,
+    lr_rampup_kimg        = 10000,
+    P_mean                = -1.2,
+    P_std                 = 1.2,
+    sigma_data            = 0.5,
+    kimg_per_tick         = 5,
+    snapshot_ticks        = 15,
+    state_dump_ticks      = 50,
+    seed                  = 0,
+    resume_pkl            = None,
+    resume_state_dump     = None,
+    resume_kimg           = 0,
+    use_fp16              = False,
+    cudnn_benchmark       = True,
+    device                = torch.device('cuda'),
 ):
     start_time = time.time()
     np.random.seed((seed * dist.get_world_size() + dist.get_rank()) % (1 << 31))
@@ -117,25 +127,26 @@ def sr_training_loop(
         )
     )
 
-    # Network — EDMSRPrecond wrapping SongUNet with 4ch input (2 noisy + 2 cond)
-    dist.print0('Constructing EDM SR model (2ch MRI)...')
+    # Network -- smaller EDMSRPrecond: channel_mult=[1,2,2,2], num_blocks=2
+    dist.print0('Constructing lightweight EDM SR model (2ch MRI, channel_mult=[1,2,2,2])...')
     net = EDMSRPrecond(
-        img_resolution  = large_size,
-        img_channels    = img_channels,
-        use_fp16        = use_fp16,
-        sigma_data      = sigma_data,
-        model_channels  = model_channels,
-        channel_mult    = channel_mult,
-        num_blocks      = num_blocks,
+        img_resolution   = large_size,
+        img_channels     = img_channels,
+        use_fp16         = use_fp16,
+        sigma_data       = sigma_data,
+        model_channels   = model_channels,
+        channel_mult     = channel_mult,
+        num_blocks       = num_blocks,
         attn_resolutions = attn_resolutions,
-        dropout         = dropout,
+        dropout          = dropout,
     )
     net.train().requires_grad_(True).to(device)
 
     if dist.get_rank() == 0:
         n_params = sum(p.numel() for p in net.parameters())
         dist.print0(f'  Parameters: {n_params:,}')
-        dist.print0(f'  Input: {img_channels*2}ch ({large_size}×{large_size}), Output: {img_channels}ch')
+        dist.print0(f'  Input: {img_channels*2}ch ({large_size}x{large_size}), Output: {img_channels}ch')
+        dist.print0(f'  channel_mult: {channel_mult}  num_blocks: {num_blocks}')
         dist.print0(f'  Cond aug: S={cond_aug_max_timestep} (always applied)')
 
     # Optimizer
@@ -275,18 +286,23 @@ def _format_time(seconds):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train EDM SR model for 2ch MRI (96→384)')
-    parser.add_argument('--data_dir',     default='/data/Sahil_dataset/MRI_processed/train/AXT2_normalized')
-    parser.add_argument('--outdir',       default='checkpoints/edm_mri_sr_384')
-    parser.add_argument('--batch',        type=int, default=32, dest='batch_size')
-    parser.add_argument('--batch_gpu',    type=int, default=None)
-    parser.add_argument('--total_kimg',   type=int, default=200000)
+    parser = argparse.ArgumentParser(
+        description='Train lightweight EDM SR model for 2ch MRI (96->384), channel_mult=[1,2,2,2]'
+    )
+    parser.add_argument('--data_dir',     default='/CBIG-Standard-ECE/Sahil/stud_teach_fastmri/processed_data/AXT2_normalized')
+    parser.add_argument('--outdir',       default='checkpoints/edm_mri_sr_384_small')
+    parser.add_argument('--batch',        type=int,   default=32,    dest='batch_size')
+    parser.add_argument('--batch_gpu',    type=int,   default=None)
+    parser.add_argument('--total_kimg',   type=int,   default=200000)
     parser.add_argument('--lr',           type=float, default=1e-4)
     parser.add_argument('--cond_aug_max_timestep', type=int, default=300)
     parser.add_argument('--model_channels', type=int, default=64)
+    parser.add_argument('--channel_mult',   type=int, nargs='+', default=[1, 2, 2, 2])
+    parser.add_argument('--num_blocks',     type=int, default=2)
+    parser.add_argument('--attn_resolutions', type=int, nargs='+', default=[16])
     parser.add_argument('--dropout',      type=float, default=0.0)
     parser.add_argument('--fp16',         action='store_true', dest='use_fp16')
-    parser.add_argument('--tick',         type=int, default=5, dest='kimg_per_tick')
+    parser.add_argument('--tick',         type=int, default=5,  dest='kimg_per_tick')
     parser.add_argument('--snap',         type=int, default=15, dest='snapshot_ticks')
     parser.add_argument('--seed',         type=int, default=0)
     parser.add_argument('--resume_pkl',   type=str, default=None)
@@ -305,7 +321,8 @@ def main():
 
     dist.print0()
     dist.print0('=' * 60)
-    dist.print0('  EDM MRI SR Training (2ch, 96→384)')
+    dist.print0('  EDM MRI SR Training -- SMALL model (2ch, 96->384)')
+    dist.print0('  channel_mult=[1,2,2,2]  num_blocks=2')
     dist.print0('  CDM Conditioning Augmentation')
     dist.print0('=' * 60)
     dist.print0(f'  Data:          {args.data_dir}')
@@ -313,26 +330,31 @@ def main():
     dist.print0(f'  Batch size:    {args.batch_size}  (batch_gpu={args.batch_gpu})')
     dist.print0(f'  GPUs:          {dist.get_world_size()}')
     dist.print0(f'  Cond aug S:    {args.cond_aug_max_timestep}')
+    dist.print0(f'  channel_mult:  {args.channel_mult}')
+    dist.print0(f'  num_blocks:    {args.num_blocks}')
     dist.print0()
 
     sr_training_loop(
-        outdir              = args.outdir,
-        data_dir            = args.data_dir,
-        batch_size          = args.batch_size,
-        batch_gpu           = args.batch_gpu,
-        total_kimg          = args.total_kimg,
-        lr                  = args.lr,
+        outdir                = args.outdir,
+        data_dir              = args.data_dir,
+        batch_size            = args.batch_size,
+        batch_gpu             = args.batch_gpu,
+        total_kimg            = args.total_kimg,
+        lr                    = args.lr,
         cond_aug_max_timestep = args.cond_aug_max_timestep,
-        model_channels      = args.model_channels,
-        dropout             = args.dropout,
-        use_fp16            = args.use_fp16,
-        kimg_per_tick       = args.kimg_per_tick,
-        snapshot_ticks      = args.snapshot_ticks,
-        seed                = args.seed,
-        resume_pkl          = args.resume_pkl,
-        resume_state_dump   = args.resume_state_dump,
-        resume_kimg         = args.resume_kimg,
-        num_workers         = args.num_workers,
+        model_channels        = args.model_channels,
+        channel_mult          = args.channel_mult,
+        num_blocks            = args.num_blocks,
+        attn_resolutions      = args.attn_resolutions,
+        dropout               = args.dropout,
+        use_fp16              = args.use_fp16,
+        kimg_per_tick         = args.kimg_per_tick,
+        snapshot_ticks        = args.snapshot_ticks,
+        seed                  = args.seed,
+        resume_pkl            = args.resume_pkl,
+        resume_state_dump     = args.resume_state_dump,
+        resume_kimg           = args.resume_kimg,
+        num_workers           = args.num_workers,
     )
 
 

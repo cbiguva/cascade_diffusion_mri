@@ -49,12 +49,18 @@ class ALPSOptions:
         Schedule exponent (7.0 matches EDM Heun sampler schedule).
     K : int
         Number of Langevin inner steps per noise level.
+    step_size : float
+        Langevin step size (matches alps.py opts.step_size).  The inner MALA
+        update is  x = x + (step²/2)*(xtilde-x) + step*n  and the
+        between-level injection is  x = x + step*n.  Default 1.0 recovers
+        the original behaviour when K=1 (direct replace).
     """
     num_steps : int   = 20
     sigma_max : float = 80.0
     sigma_min : float = 0.002
     rho       : float = 7.0
     K         : int   = 1
+    step_size : float = 1.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,37 +156,47 @@ def ALPS(
     """
     Annealed Langevin Posterior Sampling (single stage).
 
-    At each noise level t_i the algorithm performs K inner steps of
-    preconditioned Langevin dynamics:
+    Matches the reference alps.py (ALPS_old_stepsize) structure:
 
-        d       = x - score(x, t)          # MMSE denoising direction
-        rhs     = A^T y / eta^2 + d / t^2
-        x_tilde = B_t * rhs                # B_t = (A^T A/eta^2 + I/t^2)^{-1}
-        x       = x_tilde + B_t^{1/2} * n  # add Langevin noise (isALPS=True)
+    Inner K steps (k < K-1)  — MALA update:
+        d      = x - score(x, t)
+        xtilde = PreCondition(Atb/eta² + d/t²)
+        n      = NoiseModulation(randn, t)
+        x      = x + (step²/2)*(xtilde - x) + step*n
+
+    Last inner step (k == K-1, i < N-1)  — look-ahead, no noise:
+        score at t_next
+        x = PreCondition(Atb/eta² + d/t_next²)   (deterministic)
+
+    Last inner step (k == K-1, i == N-1)  — final level:
+        score at t, x = xtilde  (deterministic)
+
+    Between levels:
+        n = NoiseModulation(randn, t_next)
+        x = x + step_size * n
 
     Parameters
     ----------
     A    : operator with .adjoint, .PreCondition, .NoiseModulation
-    net  : denoiser with .forward and .vjp
+    net  : denoiser
     y    : (B, C, H, W)  measurements
-    opts : ALPSOptions
+    opts : ALPSOptions  (includes step_size)
     isALPS : True → posterior sample;  False → MAP estimate (no noise)
     storeIntermediate : if True return all iterates as second output
 
     Returns
     -------
     x         : (B, C, H, W)  final reconstruction
-    xsample   : (num_steps, B, C, H, W)  intermediate iterates (only if
-                storeIntermediate=True)
+    xsample   : (num_steps, B, C, H, W)  iterates (only if storeIntermediate)
     """
     device  = y.device
     t_steps = giveTsteps(opts.sigma_max, opts.sigma_min, opts.rho,
                          opts.num_steps, device)
+    step    = float(opts.step_size)
 
-    # Initialise from zero-filled adjoint solution
+    # ── Initialise from PreConditioned adjoint + noise ────────────────────────
     Atb    = A.adjoint(y).detach()
     xtilde = A.PreCondition(Atb / A.eta2, t_steps[0].item())
-
     if isALPS:
         n = A.NoiseModulation(torch.randn_like(xtilde), t_steps[0].item())
         x = (xtilde + n).detach()
@@ -188,40 +204,53 @@ def ALPS(
         x = xtilde.detach()
 
     if storeIntermediate:
-        xshape    = [opts.num_steps] + list(x.shape)
-        xsample   = torch.zeros(xshape, dtype=x.dtype)
+        xsample = torch.zeros([opts.num_steps] + list(x.shape), dtype=x.dtype)
 
     for i, t in enumerate(t_steps):
-        t_val = t.item()
-        # Match the iterate dtype: t_steps is float64 (schedule precision), but
-        # feeding a float64 sigma promotes the score to float64 through vjp's
-        # sigma-preconditioning, which then leaks into the net input.
-        sigma = t.reshape(-1, 1, 1, 1).to(device=device, dtype=x.dtype)
+        t_val   = t.item()
+        is_last = (i == len(t_steps) - 1)
+        sigma   = t.reshape(-1, 1, 1, 1).to(device=device, dtype=x.dtype)
 
         for k in range(opts.K):
-            # ── Score step ──────────────────────────────────────────────
-            _, score = giveScore(x, net, sigma, precondition=True)
-            d = (x - score).detach()
 
-            # ── Preconditioned data-consistency update ───────────────────
-            rhs    = Atb / A.eta2 + d / t_val ** 2
-            xtilde = A.PreCondition(rhs, t_val).detach()
-
-            # ── Langevin noise injection (all but final inner step) ──────
             if isALPS and (k < opts.K - 1):
-                n = A.NoiseModulation(torch.randn_like(x), t_val)
-                x = (xtilde + n).detach()
+                # ── MALA inner step (matches alps.py inner loop) ─────────
+                _, score = giveScore(x, net, sigma, precondition=True)
+                d      = (x - score).detach()
+                rhs    = Atb / A.eta2 + d / t_val ** 2
+                xtilde = A.PreCondition(rhs, t_val).detach()
+                n      = A.NoiseModulation(torch.randn_like(x), t_val)
+                # drift toward xtilde + Langevin noise
+                x = (x + (step ** 2 / 2) * (xtilde - x) + step * n).detach()
+
             else:
-                x = xtilde
+                # ── Last inner step: look-ahead to t_next (no noise) ─────
+                if not is_last:
+                    t_next  = t_steps[i + 1].item()
+                    sigma_n = t_steps[i + 1].reshape(-1, 1, 1, 1).to(
+                                  device=device, dtype=x.dtype)
+                    _, score = giveScore(x, net, sigma_n, precondition=True)
+                    d      = (x - score).detach()
+                    rhs    = Atb / A.eta2 + d / t_next ** 2
+                    xtilde = A.PreCondition(rhs, t_next).detach()
+                    x      = xtilde          # deterministic — noise added below
+                else:
+                    # Final level: use current t, no noise
+                    _, score = giveScore(x, net, sigma, precondition=True)
+                    d      = (x - score).detach()
+                    rhs    = Atb / A.eta2 + d / t_val ** 2
+                    xtilde = A.PreCondition(rhs, t_val).detach()
+                    x      = xtilde
 
         if storeIntermediate:
             xsample[i] = x.detach().cpu()
 
-        # ── Move to next noise level ─────────────────────────────────────
-        if i < len(t_steps) - 1:
+        # ── Between-level noise injection (matches alps.py) ───────────────────
+        # x = x + step_size * n   (additive on current x, not xtilde + n)
+        if not is_last:
             t_next = t_steps[i + 1].item()
             n      = A.NoiseModulation(torch.randn_like(x), t_next)
-            x      = (xtilde + n).detach()
+            x      = (x + step * n).detach()
 
     if storeIntermediate:
         return x, xsample
