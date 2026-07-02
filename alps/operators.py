@@ -363,18 +363,37 @@ class MRIOperator(nn.Module):
         """
         Draw a sample with covariance  B_t = (AᴴA/eta² + I/t²)⁻¹.
 
-        Construction (exact for any linear A):
-            z   = Aᴴ ε₁ / eta + ε₂ / t,   ε₁,ε₂ ~ N(0, I)
-            ⇒  Cov(z) = AᴴA/eta² + I/t² = Pₜ
-            n'  = B_t z = Pₜ⁻¹ z   ⇒  Cov(n') = B_t
-        ε₂ is the image-space noise passed in as `n`; ε₁ is drawn here in
-        multi-coil measurement space.  Reuses the same CG solve as
-        PreCondition (the Pₜ⁻¹ apply).
+        Closed-form diagonal k-space gain filter (matching sense_new.py):
+
+            N    = FFT(n)
+            gain = 1 / sqrt(mask/eta² + 1/t²)
+            n'   = IFFT(N * gain)
+
+        This is the exact formula when AᴴA is diagonal in k-space (coil-
+        combined / single-coil SENSE).  For full multi-coil SENSE it is an
+        efficient approximation that matches the sense_new.py reference.
+
+        Parameters
+        ----------
+        n : (B, 2, H, W)  image-space white noise  (real/imag channels)
+        t : float          current noise level (sigma)
         """
-        B, _, H, W = n.shape
-        eps1 = torch.randn(B, self.n_coils, H, W, device=n.device, dtype=n.dtype) \
-             + 1j * torch.randn(B, self.n_coils, H, W, device=n.device, dtype=n.dtype)
-        z = self.adjoint(eps1) / self.eta + n / t
-        return self.PreCondition(z, t)
+        # Convert (B, 2, H, W) → (B, H, W) complex
+        nc = _to_complex(n)                                   # (B, H, W)
+
+        # Transform to k-space (same centred-ortho convention as forward/adjoint)
+        N = _fft2(nc)                                         # (B, H, W) complex
+
+        # Diagonal gain:  1 / sqrt(mask/eta² + 1/t²)
+        # mask is (1,1,H,W); squeeze to (H,W) so it broadcasts cleanly with (B,H,W).
+        gain = 1.0 / torch.sqrt(
+            self.mask.squeeze(0).squeeze(0) / self.eta2 + 1.0 / (t ** 2)
+        )                                                     # (H, W)
+
+        N = N * gain                                          # (B, H, W)
+
+        # Transform back to image space
+        nw = _ifft2(N)                                        # (B, H, W) complex
+        return _to_2ch(nw)                                    # (B, 2, H, W)
 
     
